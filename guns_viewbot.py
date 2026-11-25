@@ -89,8 +89,8 @@ logger = LogManager()
 class State:
     def __init__(self):
         self.target = "https://guns.lol/osintowner"
-        self.threads = 8
-        self.timeout = 22
+        self.threads = 12
+        self.timeout = 16
         self.sent = 0
         self.success = 0
         self.failed = 0
@@ -149,6 +149,17 @@ def test_cf_proxy(p):
 
 def fetch_live_candidates():
     candidates = set()
+    # Eğer yerel proxies.txt varsa ondan da örnek al
+    if os.path.exists("proxies.txt"):
+        try:
+            with open("proxies.txt", "r", encoding="utf-8", errors="ignore") as pf:
+                sample_lines = [l.strip() for l in pf if ":" in l and not l.startswith("#")]
+                if sample_lines:
+                    for item in random.sample(sample_lines, min(len(sample_lines), 300)):
+                        candidates.add(item)
+        except Exception:
+            pass
+
     for u in LIVE_API_SOURCES:
         try:
             r = requests.get(u, timeout=4)
@@ -194,17 +205,19 @@ def get_chrome_executable():
         return env_bin
     
     candidates = [
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
-        "/opt/render/project/chrome/opt/google/chrome/chrome",
-        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+        "/opt/render/project/chrome/opt/google/chrome/chrome"
     ]
     for c in candidates:
         if os.path.exists(c):
             return c
-    found = shutil.which("google-chrome") or shutil.which("google-chrome-stable") or shutil.which("chrome")
+    found = shutil.which("chrome") or shutil.which("google-chrome") or shutil.which("google-chrome-stable")
     return found
 
 
@@ -223,14 +236,15 @@ def create_driver(proxy=None):
     options.add_argument("--no-first-run")
     options.add_argument("--no-service-autorun")
     options.add_argument("--password-store=basic")
-    options.add_argument("--window-position=-2500,-2500")
-    options.add_argument("--window-size=500,500")
+    options.add_argument("--window-position=-3000,-3000")
+    options.add_argument("--window-size=300,300")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
+    options.add_argument("--mute-audio")
     options.add_argument("--disk-cache-size=1")
     options.add_argument("--media-cache-size=1")
     options.add_argument("--blink-settings=imagesEnabled=false")
@@ -293,9 +307,9 @@ def worker(worker_id, verified_queue, timeout):
             driver.get(target_url)
 
             success = False
-            iterations = int(timeout / 0.3)
+            iterations = int(timeout / 0.15)
             for _ in range(iterations):
-                time.sleep(0.3)
+                time.sleep(0.15)
                 done = driver.execute_script("return window.__analytics_done || false;")
                 if done:
                     status = driver.execute_script("return window.__analytics_status || 0;")
@@ -522,8 +536,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div class="card">
                 <div class="card-title">Aktif Worker</div>
-                <div class="card-value" id="valWorkers">8</div>
-                <div class="card-sub">PID Güvenli Browser</div>
+                <div class="card-value" id="valWorkers">12</div>
+                <div class="card-sub">16GB Turbo Edition</div>
             </div>
             <div class="card">
                 <div class="card-title">Canlı Proxy Havuzu</div>
@@ -676,14 +690,14 @@ def start_web_server(port):
 
 
 def main():
-    default_threads = int(os.environ.get("THREADS", 8))
+    default_threads = int(os.environ.get("THREADS", 12))
     default_target = os.environ.get("TARGET_URL", "https://guns.lol/osintowner")
     web_port = int(os.environ.get("PORT", 10000))
 
-    parser = argparse.ArgumentParser(description="guns.lol Mega-Turbo View Bot (PID Safe & Cloud Scaled)")
+    parser = argparse.ArgumentParser(description="guns.lol Mega-Turbo View Bot (16GB RAM High-Performance PC Edition)")
     parser.add_argument("-u", "--url", "--user", dest="target", default=default_target, help="Guns.lol hedefi")
-    parser.add_argument("-t", "--threads", type=int, default=default_threads, help="Worker sayısı")
-    parser.add_argument("--timeout", type=int, default=22, help="View zaman aşımı")
+    parser.add_argument("-t", "--threads", type=int, default=default_threads, help="Worker sayısı (Varsayılan: 12)")
+    parser.add_argument("--timeout", type=int, default=15, help="View zaman aşımı")
     parser.add_argument("-p", "--proxy-file", dest="proxy_file", help="Özel proxy dosyası")
     parser.add_argument("--direct", action="store_true", help="Proxy olmadan çalıştır")
     args = parser.parse_args()
@@ -721,14 +735,14 @@ def main():
         else:
             producer_t = threading.Thread(target=proxy_producer_loop, args=(verified_queue, stop_event), daemon=True)
             producer_t.start()
-            # Havuzun dolması için 5 saniye bekle
-            time.sleep(5)
+            # Havuzun dolması için 4 saniye bekle
+            time.sleep(4)
 
-    # Worker'ları Render PID limitini aşmamak için 0.8s aralıklarla kademeli başlat
+    # Worker'ları kademeli başlat
     for i in range(state.threads):
         t = threading.Thread(target=worker, args=(i + 1, verified_queue, state.timeout), daemon=True)
         t.start()
-        time.sleep(0.8)
+        time.sleep(0.3)
 
     try:
         while True:
