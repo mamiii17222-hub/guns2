@@ -94,6 +94,7 @@ class State:
         self.sent = 0
         self.success = 0
         self.failed = 0
+        self.unique_ips = 0
         self.active_proxies = 0
         self.paused = False
         self.start_time = time.time()
@@ -103,6 +104,7 @@ class State:
         with self.lock:
             self.sent += 1
             self.success += 1
+            self.unique_ips += 1
 
     def add_fail(self):
         with self.lock:
@@ -120,6 +122,7 @@ class State:
                 "sent": self.sent,
                 "success": self.success,
                 "failed": self.failed,
+                "unique_ips": self.unique_ips,
                 "success_pct": success_pct,
                 "rate_sec": rate,
                 "rate_min": int(rate * 60),
@@ -132,8 +135,44 @@ class State:
 
 state = State()
 
+used_ips = set()
+used_proxies = set()
+used_lock = threading.Lock()
+
+
+class CandidateManager:
+    def __init__(self, proxy_file="proxies.txt"):
+        self.candidates = []
+        self.cursor = 0
+        self.lock = threading.Lock()
+        if proxy_file and os.path.exists(proxy_file):
+            try:
+                with open(proxy_file, "r", encoding="utf-8", errors="ignore") as f:
+                    self.candidates = [l.strip() for l in f if ":" in l and not l.startswith("#")]
+                random.shuffle(self.candidates)
+            except Exception:
+                pass
+
+    def get_batch(self, batch_size=400):
+        batch = []
+        with self.lock:
+            if self.candidates:
+                end = min(self.cursor + batch_size, len(self.candidates))
+                batch.extend(self.candidates[self.cursor:end])
+                self.cursor = end
+                if self.cursor >= len(self.candidates):
+                    random.shuffle(self.candidates)
+                    self.cursor = 0
+        return batch
+
+
+candidate_mgr = CandidateManager("proxies.txt")
+
 
 def test_cf_proxy(p):
+    with used_lock:
+        if p in used_proxies:
+            return None
     try:
         r = requests.get(
             "https://cloudflare.com/cdn-cgi/trace",
@@ -141,7 +180,18 @@ def test_cf_proxy(p):
             timeout=2.5
         )
         if r.status_code == 200 and "ip=" in r.text:
-            return p
+            exit_ip = None
+            for line in r.text.splitlines():
+                if line.startswith("ip="):
+                    exit_ip = line.split("=", 1)[1].strip()
+                    break
+            if exit_ip:
+                with used_lock:
+                    if exit_ip in used_ips or p in used_proxies:
+                        return None
+                    used_ips.add(exit_ip)
+                    used_proxies.add(p)
+                return (p, exit_ip)
     except Exception:
         pass
     return None
@@ -149,20 +199,13 @@ def test_cf_proxy(p):
 
 def fetch_live_candidates():
     candidates = set()
-    # Eğer yerel proxies.txt varsa ondan da örnek al
-    if os.path.exists("proxies.txt"):
-        try:
-            with open("proxies.txt", "r", encoding="utf-8", errors="ignore") as pf:
-                sample_lines = [l.strip() for l in pf if ":" in l and not l.startswith("#")]
-                if sample_lines:
-                    for item in random.sample(sample_lines, min(len(sample_lines), 300)):
-                        candidates.add(item)
-        except Exception:
-            pass
+    # 67 bin satırlık proxies.txt dosyasından sırayla batch al
+    for p in candidate_mgr.get_batch(350):
+        candidates.add(p)
 
     for u in LIVE_API_SOURCES:
         try:
-            r = requests.get(u, timeout=4)
+            r = requests.get(u, timeout=3)
             if "geonode" in u:
                 data = r.json().get("data", [])
                 for item in data:
@@ -174,13 +217,15 @@ def fetch_live_candidates():
                         candidates.add(l)
         except Exception:
             pass
-    cand_list = list(candidates)
+
+    with used_lock:
+        cand_list = [c for c in candidates if c not in used_proxies]
     random.shuffle(cand_list)
     return cand_list
 
 
 def proxy_producer_loop(verified_queue, stop_event):
-    logger.emit("100-Thread Turbo Proxy Doğrulayıcı motoru devrede.", "SYSTEM")
+    logger.emit("100-Thread Turbo Proxy & 1-IP-1-Chrome Doğrulayıcı devrede.", "SYSTEM")
     while not stop_event.is_set():
         if verified_queue.qsize() < 100:
             candidates = fetch_live_candidates()
@@ -188,15 +233,15 @@ def proxy_producer_loop(verified_queue, stop_event):
                 with ThreadPoolExecutor(max_workers=100) as ex:
                     results = ex.map(test_cf_proxy, candidates[:500])
                     added = 0
-                    for p in results:
-                        if p:
-                            verified_queue.put(p)
+                    for item in results:
+                        if item:
+                            verified_queue.put(item)
                             added += 1
                             with state.lock:
                                 state.active_proxies = verified_queue.qsize()
                     if added > 0:
-                        logger.emit(f"Havuz güncellendi: +{added} yeni canlı Cloudflare proxy eklendi (Havuz: {verified_queue.qsize()})", "SUCCESS")
-        time.sleep(4)
+                        logger.emit(f"Havuz güncellendi: +{added} benzersiz tekil IP eklendi (Havuz: {verified_queue.qsize()})", "SUCCESS")
+        time.sleep(3)
 
 
 def get_chrome_executable():
@@ -290,9 +335,15 @@ def worker(worker_id, verified_queue, timeout):
             continue
 
         proxy = None
+        exit_ip = "Direct"
         if verified_queue is not None:
             try:
-                proxy = verified_queue.get(timeout=4)
+                item = verified_queue.get(timeout=4)
+                if isinstance(item, tuple):
+                    proxy, exit_ip = item
+                else:
+                    proxy = item
+                    exit_ip = item.split(":")[0] if ":" in item else item
                 with state.lock:
                     state.active_proxies = verified_queue.qsize()
             except queue.Empty:
@@ -319,15 +370,15 @@ def worker(worker_id, verified_queue, timeout):
 
             if success:
                 state.add_success()
-                logger.emit(f"Worker #{worker_id} -> VIEW BAŞARILI! (Proxy: {proxy})", "SUCCESS")
+                logger.emit(f"Worker #{worker_id} -> VIEW BAŞARILI! [1 IP : 1 Chrome -> {exit_ip}] (Proxy: {proxy})", "SUCCESS")
             else:
                 state.add_fail()
-                logger.emit(f"Worker #{worker_id} -> Zaman aşımı/Drop (Proxy: {proxy})", "WARN")
+                logger.emit(f"Worker #{worker_id} -> Zaman aşımı/Drop [{exit_ip}] (Proxy: {proxy})", "WARN")
 
         except Exception as e:
             state.add_fail()
             err_msg = str(e).split('\n')[0][:75]
-            logger.emit(f"Worker #{worker_id} -> {err_msg}", "ERROR")
+            logger.emit(f"Worker #{worker_id} -> {err_msg} [{exit_ip}]", "ERROR")
         finally:
             if driver:
                 try:
@@ -530,6 +581,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="card-sub" id="valSuccessPct">%100 Başarı Oranı</div>
             </div>
             <div class="card">
+                <div class="card-title">Benzersiz Tekil IP</div>
+                <div class="card-value" id="valUniqueIps" style="color: #ffaa00;">0</div>
+                <div class="card-sub">1 Chrome = 1 Tekil IP</div>
+            </div>
+            <div class="card">
                 <div class="card-title">Anlık Hız</div>
                 <div class="card-value" id="valSpeed">0.0</div>
                 <div class="card-sub" id="valSpeedExt">0 view / dakika</div>
@@ -563,6 +619,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const res = await fetch('/api/metrics');
                 const data = await res.json();
                 document.getElementById('valSuccess').innerText = data.success.toLocaleString();
+                document.getElementById('valUniqueIps').innerText = (data.unique_ips || 0).toLocaleString();
                 document.getElementById('valSuccessPct').innerText = `%${data.success_pct} Başarı Oranı (${data.failed} drop)`;
                 document.getElementById('valSpeed').innerText = `${data.rate_sec} v/s`;
                 document.getElementById('valSpeedExt').innerText = `${data.rate_min} v/dk ~ ${data.rate_hour} v/saat`;
@@ -726,17 +783,13 @@ def main():
         verified_queue = queue.Queue()
         if args.proxy_file and os.path.exists(args.proxy_file):
             logger.emit(f"'{args.proxy_file}' dosyasındaki özel proxyler yükleniyor...", "INFO")
-            with open(args.proxy_file, "r", encoding="utf-8") as f:
-                p_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-            for p in p_lines:
-                verified_queue.put(p)
-            state.active_proxies = verified_queue.qsize()
-            logger.emit(f"{state.active_proxies} adet özel proxy yüklendi.", "INFO")
-        else:
-            producer_t = threading.Thread(target=proxy_producer_loop, args=(verified_queue, stop_event), daemon=True)
-            producer_t.start()
-            # Havuzun dolması için 4 saniye bekle
-            time.sleep(4)
+            global candidate_mgr
+            candidate_mgr = CandidateManager(args.proxy_file)
+        
+        producer_t = threading.Thread(target=proxy_producer_loop, args=(verified_queue, stop_event), daemon=True)
+        producer_t.start()
+        # Havuzun dolması için 4 saniye bekle
+        time.sleep(4)
 
     # Worker'ları kademeli başlat
     for i in range(state.threads):
