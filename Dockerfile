@@ -1,27 +1,23 @@
 FROM python:3.11-slim
 
-# Install system dependencies, Google Chrome, and Xvfb
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base tools and Xvfb
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     curl \
     gnupg \
     unzip \
     xvfb \
-    libxi6 \
-    libgconf-2-4 \
-    libnss3 \
-    libfontconfig1 \
-    libxss1 \
-    libasound2 \
     ca-certificates \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Google Chrome Stable
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
-    && sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+# Install official Google Chrome Stable
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get update \
-    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && apt-get install -y --no-install-recommends ./google-chrome-stable_current_amd64.deb \
+    && rm -f google-chrome-stable_current_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -37,5 +33,5 @@ ENV PORT=10000
 ENV THREADS=35
 ENV TARGET_URL=https://guns.lol/osintowner
 
-# Start Xvfb virtual display with high resolution and launch 35 parallel browser workers
+# Start virtual display and run 35-worker turbo bot
 CMD Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset & python guns_viewbot.py -u $TARGET_URL -t $THREADS
