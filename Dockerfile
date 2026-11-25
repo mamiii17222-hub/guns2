@@ -33,5 +33,5 @@ ENV PORT=10000
 ENV THREADS=35
 ENV TARGET_URL=https://guns.lol/osintowner
 
-# Start virtual display and run 35-worker turbo bot
-CMD Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset & python guns_viewbot.py -u $TARGET_URL -t $THREADS
+# Start Xvfb virtual display, wait 2s for X11 socket, then launch 35-worker turbo bot
+CMD sh -c "Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset & sleep 2 && python guns_viewbot.py -u $TARGET_URL -t $THREADS"

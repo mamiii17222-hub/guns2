@@ -14,10 +14,11 @@ import queue
 import argparse
 import json
 import re
+import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 # Distutils compatibility for Python 3.12+ / 3.14+
 try:
@@ -61,7 +62,6 @@ LIVE_API_SOURCES = [
 
 
 class LogManager:
-    """Bellek içi halka arabellek (ring buffer) log akışı yöneticisi."""
     def __init__(self, max_entries=200):
         self.logs = []
         self.lock = threading.Lock()
@@ -74,7 +74,6 @@ class LogManager:
             self.logs.append(entry)
             if len(self.logs) > self.max_entries:
                 self.logs.pop(0)
-        # Terminale de bas
         print(f"[{ts}] [{level}] {message}", flush=True)
 
     def get_logs(self):
@@ -137,7 +136,7 @@ def test_cf_proxy(p):
         r = requests.get(
             "https://cloudflare.com/cdn-cgi/trace",
             proxies={"http": f"http://{p}", "https": f"http://{p}"},
-            timeout=2.0
+            timeout=2.5
         )
         if r.status_code == 200 and "ip=" in r.text:
             return p
@@ -172,14 +171,41 @@ def proxy_producer_loop(verified_queue, stop_event):
     while not stop_event.is_set():
         if verified_queue.qsize() < 100:
             candidates = fetch_live_candidates()
-            with ThreadPoolExecutor(max_workers=100) as ex:
-                results = ex.map(test_cf_proxy, candidates[:600])
-                for p in results:
-                    if p:
-                        verified_queue.put(p)
-                        with state.lock:
-                            state.active_proxies = verified_queue.qsize()
-        time.sleep(4)
+            if candidates:
+                logger.emit(f"Proxy motoru: {len(candidates)} adet aday test ediliyor...", "INFO")
+                with ThreadPoolExecutor(max_workers=100) as ex:
+                    results = ex.map(test_cf_proxy, candidates[:500])
+                    added = 0
+                    for p in results:
+                        if p:
+                            verified_queue.put(p)
+                            added += 1
+                            with state.lock:
+                                state.active_proxies = verified_queue.qsize()
+                    if added > 0:
+                        logger.emit(f"Havuz güncellendi: +{added} yeni canlı Cloudflare proxy eklendi (Toplam: {state.active_proxies})", "SUCCESS")
+        time.sleep(5)
+
+
+def get_chrome_executable():
+    """Çalışma ortamına göre Google Chrome yolunu kesin tespit eder."""
+    env_bin = os.environ.get("CHROME_BIN")
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+    
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/opt/render/project/chrome/opt/google/chrome/chrome",
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    found = shutil.which("google-chrome") or shutil.which("google-chrome-stable") or shutil.which("chrome")
+    return found
 
 
 def create_driver(proxy=None):
@@ -199,12 +225,9 @@ def create_driver(proxy=None):
     options.add_argument("--media-cache-size=1")
     options.add_argument("--blink-settings=imagesEnabled=false")
 
-    # Render Linux Chrome path detection
-    chrome_bin = os.environ.get("CHROME_BIN")
-    if chrome_bin and os.path.exists(chrome_bin):
+    chrome_bin = get_chrome_executable()
+    if chrome_bin:
         options.binary_location = chrome_bin
-    elif os.path.exists("/opt/render/project/chrome/opt/google/chrome/chrome"):
-        options.binary_location = "/opt/render/project/chrome/opt/google/chrome/chrome"
 
     if proxy:
         if not proxy.startswith("http"):
@@ -241,11 +264,12 @@ def worker(worker_id, verified_queue, timeout):
         proxy = None
         if verified_queue is not None:
             try:
+                # Havuzda proxy yoksa 3 saniye bekle
                 proxy = verified_queue.get(timeout=3)
                 with state.lock:
                     state.active_proxies = verified_queue.qsize()
             except queue.Empty:
-                time.sleep(0.2)
+                time.sleep(0.5)
                 continue
 
         target_url = state.target
@@ -256,9 +280,9 @@ def worker(worker_id, verified_queue, timeout):
             driver.get(target_url)
 
             success = False
-            iterations = int(timeout / 0.2)
+            iterations = int(timeout / 0.25)
             for _ in range(iterations):
-                time.sleep(0.2)
+                time.sleep(0.25)
                 done = driver.execute_script("return window.__analytics_done || false;")
                 if done:
                     status = driver.execute_script("return window.__analytics_status || 0;")
@@ -271,9 +295,12 @@ def worker(worker_id, verified_queue, timeout):
                 logger.emit(f"Worker #{worker_id} -> View başarıyla gönderildi! (Proxy: {proxy})", "SUCCESS")
             else:
                 state.add_fail()
+                logger.emit(f"Worker #{worker_id} -> View zaman aşımına düştü (Proxy: {proxy})", "WARN")
 
         except Exception as e:
             state.add_fail()
+            err_msg = str(e).split('\n')[0][:90]
+            logger.emit(f"Worker #{worker_id} -> Tarayıcı/Bağlantı Hatası: {err_msg}", "ERROR")
         finally:
             if driver:
                 try:
@@ -449,7 +476,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .controls button:hover { opacity: 0.9; }
         .btn-pause { background: #ffcb6b !important; }
-        .btn-danger { background: var(--danger) !important; color: #fff !important; }
     </style>
 </head>
 <body>
@@ -659,6 +685,9 @@ def main():
     threading.Thread(target=start_web_server, args=(web_port,), daemon=True).start()
 
     logger.emit(f"GUNS.LOL TURBO VIEW BOT AKTİF. Hedef: {state.target} | Worker: {state.threads}", "SYSTEM")
+
+    chrome_path = get_chrome_executable()
+    logger.emit(f"Tespit edilen Chrome: {chrome_path}", "INFO")
 
     verified_queue = None
     stop_event = threading.Event()
