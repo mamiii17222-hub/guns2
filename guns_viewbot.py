@@ -49,15 +49,15 @@ if sys.platform == "win32":
         pass
 
 
+SOCKS5_JSON_URL = "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/socks5/data.json"
+
 LIVE_API_SOURCES = [
-    "https://proxylist.geonode.com/api/proxy-list?limit=300&page=1&sort_by=lastChecked&sort_type=desc",
-    "https://proxylist.geonode.com/api/proxy-list?limit=300&page=2&sort_by=lastChecked&sort_type=desc",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=3000&country=all",
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=yes",
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-    "https://raw.githubusercontent.com/zloi-user/hideip.me/master/https.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/officialputuid/Kimmy-Proxy/master/http.txt"
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"
 ]
 
 driver_spawn_lock = threading.Lock()
@@ -169,70 +169,85 @@ class CandidateManager:
 candidate_mgr = CandidateManager("proxies.txt")
 
 
-def test_cf_proxy(p):
+def test_proxy(p):
     with used_lock:
         if p in used_proxies:
             return None
-    try:
-        r = requests.get(
-            "https://guns.lol/cdn-cgi/trace",
-            proxies={"http": f"http://{p}", "https": f"http://{p}"},
-            timeout=3.5,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r.status_code == 200 and "ip=" in r.text and "h=guns.lol" in r.text:
-            exit_ip = None
-            for line in r.text.splitlines():
-                if line.startswith("ip="):
-                    exit_ip = line.split("=", 1)[1].strip()
-                    break
-            if exit_ip:
-                with used_lock:
-                    if exit_ip in used_ips or p in used_proxies:
-                        return None
-                    used_ips.add(exit_ip)
-                    used_proxies.add(p)
-                return (p, exit_ip)
-    except Exception:
-        pass
+    endpoints = ["http://api.ipify.org", "http://icanhazip.com"]
+    target_ep = random.choice(endpoints)
+    if p.startswith("socks5://") or p.startswith("http://"):
+        protos = [p]
+    else:
+        protos = [f"socks5://{p}", f"http://{p}"]
+    
+    for proto in protos:
+        try:
+            r = requests.get(
+                target_ep,
+                proxies={"http": proto, "https": proto},
+                timeout=2.5,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            if r.status_code == 200:
+                exit_ip = r.text.strip()
+                if exit_ip and ("." in exit_ip or ":" in exit_ip) and len(exit_ip) <= 45:
+                    with used_lock:
+                        if exit_ip in used_ips or p in used_proxies:
+                            return None
+                        used_ips.add(exit_ip)
+                        used_proxies.add(p)
+                    return (proto, exit_ip)
+        except Exception:
+            pass
     return None
 
 
 def fetch_live_candidates():
-    candidates = set()
-    # 67 bin satırlık proxies.txt dosyasından sırayla batch al
-    for p in candidate_mgr.get_batch(350):
-        candidates.add(p)
+    candidates = []
+    
+    # 1. Öncelik: Kullanıcının verdiği jsdelivr SOCKS5 JSON endpointi
+    try:
+        r = requests.get(SOCKS5_JSON_URL, timeout=5)
+        if r.status_code == 200:
+            items = r.json()
+            if isinstance(items, list):
+                sorted_items = sorted(items, key=lambda x: (-x.get("uptime_percent", 0), x.get("latency_ms", 99999)))
+                for item in sorted_items:
+                    ip = item.get("ip")
+                    port = item.get("port")
+                    if ip and port:
+                        candidates.append(f"socks5://{ip}:{port}")
+    except Exception:
+        pass
 
+    # 2. Öncelik: Diğer canlı SOCKS5 listeleri
     for u in LIVE_API_SOURCES:
         try:
             r = requests.get(u, timeout=3)
-            if "geonode" in u:
-                data = r.json().get("data", [])
-                for item in data:
-                    candidates.add(f"{item['ip']}:{item['port']}")
-            else:
-                for l in r.text.splitlines():
-                    l = l.strip()
-                    if ":" in l and not l.startswith("#"):
-                        candidates.add(l)
+            for l in r.text.splitlines():
+                l = l.strip()
+                if ":" in l and not l.startswith("#"):
+                    candidates.append(f"socks5://{l}" if "socks5" in u else l)
         except Exception:
             pass
 
+    # 3. Yerel proxies.txt'den batch
+    for p in candidate_mgr.get_batch(100):
+        candidates.append(p)
+
     with used_lock:
         cand_list = [c for c in candidates if c not in used_proxies]
-    random.shuffle(cand_list)
     return cand_list
 
 
 def proxy_producer_loop(verified_queue, stop_event):
-    logger.emit("100-Thread Turbo Proxy & 1-IP-1-Chrome Doğrulayıcı devrede.", "SYSTEM")
+    logger.emit("100-Thread Bağımsız Proxy & 1-IP-1-Chrome Doğrulayıcı devrede.", "SYSTEM")
     while not stop_event.is_set():
         if verified_queue.qsize() < 100:
             candidates = fetch_live_candidates()
             if candidates:
                 with ThreadPoolExecutor(max_workers=100) as ex:
-                    results = ex.map(test_cf_proxy, candidates[:500])
+                    results = ex.map(test_proxy, candidates[:500])
                     added = 0
                     for item in results:
                         if item:
@@ -241,7 +256,7 @@ def proxy_producer_loop(verified_queue, stop_event):
                             with state.lock:
                                 state.active_proxies = verified_queue.qsize()
                     if added > 0:
-                        logger.emit(f"Havuz güncellendi: +{added} benzersiz tekil IP eklendi (Havuz: {verified_queue.qsize()})", "SUCCESS")
+                        logger.emit(f"Havuz güncellendi: +{added} bağımsız tekil IP eklendi (Havuz: {verified_queue.qsize()})", "SUCCESS")
         time.sleep(3)
 
 
@@ -292,17 +307,18 @@ def create_driver(proxy=None):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
     options.add_argument("--mute-audio")
-    options.add_argument("--disk-cache-size=1")
-    options.add_argument("--media-cache-size=1")
     options.add_argument("--blink-settings=imagesEnabled=false")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors")
+    options.add_argument("--allow-running-insecure-content")
 
     chrome_bin = get_chrome_executable()
     if chrome_bin:
         options.binary_location = chrome_bin
 
     if proxy:
-        if not proxy.startswith("http"):
-            options.add_argument(f"--proxy-server=http://{proxy}")
+        if not proxy.startswith("http") and not proxy.startswith("socks"):
+            options.add_argument(f"--proxy-server=socks5://{proxy}")
         else:
             options.add_argument(f"--proxy-server={proxy}")
 
@@ -611,9 +627,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="card-sub">16GB Turbo Edition</div>
             </div>
             <div class="card">
-                <div class="card-title">Canlı Proxy Havuzu</div>
+                <div class="card-title">Canlı SOCKS5 Havuzu</div>
                 <div class="card-value" id="valProxies" style="color: #c792ea;">0</div>
-                <div class="card-sub">Cloudflare Doğrulanmış</div>
+                <div class="card-sub">Uptime ve Hız Filtreli</div>
             </div>
         </div>
 
