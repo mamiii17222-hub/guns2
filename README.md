@@ -21,3 +21,4 @@ python guns_viewbot.py -u https://guns.lol/osintowner -p proxies.txt -t 6
 ## Render Deployment
 1. Connect this repo to Render (Web Service, Docker environment).
 2. Render builds the Dockerfile and runs the bot 24/7 continuously.
+# guns
