@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-guns.lol Mega-Turbo Automated View Bot (Enterprise Multi-Core & Render Scaled)
-Engineered for 12 CPU Cores & 96 GB RAM Architecture
+guns.lol Mega-Turbo Automated View Bot with Live Web Dashboard & Log Stream
+Engineered for 24/7 Render Deployment (12 CPU / 96 GB RAM Scaled)
 Author: III
 """
 
@@ -14,9 +14,12 @@ import queue
 import argparse
 import json
 import re
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
-# Setuptools distutils compat for Python 3.12+ / 3.14+
+# Distutils compatibility for Python 3.12+ / 3.14+
 try:
     import setuptools._distutils as distutils
     import setuptools._distutils.version as distutils_version
@@ -28,14 +31,12 @@ except ImportError:
 try:
     import requests
 except ImportError:
-    print("[!] 'requests' kütüphanesi eksik. Yükleniyor...")
     os.system(f"{sys.executable} -m pip install requests")
     import requests
 
 try:
     import undetected_chromedriver as uc
 except ImportError:
-    print("[!] 'undetected-chromedriver' eksik. Yükleniyor...")
     os.system(f"{sys.executable} -m pip install undetected-chromedriver setuptools")
     import undetected_chromedriver as uc
 
@@ -45,17 +46,6 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding='utf-8')
     except Exception:
         pass
-
-
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
 
 
 LIVE_API_SOURCES = [
@@ -70,14 +60,43 @@ LIVE_API_SOURCES = [
 ]
 
 
-class Stats:
+class LogManager:
+    """Bellek içi halka arabellek (ring buffer) log akışı yöneticisi."""
+    def __init__(self, max_entries=200):
+        self.logs = []
+        self.lock = threading.Lock()
+        self.max_entries = max_entries
+
+    def emit(self, message, level="INFO"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = {"time": ts, "message": message, "level": level}
+        with self.lock:
+            self.logs.append(entry)
+            if len(self.logs) > self.max_entries:
+                self.logs.pop(0)
+        # Terminale de bas
+        print(f"[{ts}] [{level}] {message}", flush=True)
+
+    def get_logs(self):
+        with self.lock:
+            return list(self.logs)
+
+
+logger = LogManager()
+
+
+class State:
     def __init__(self):
+        self.target = "https://guns.lol/osintowner"
+        self.threads = 35
+        self.timeout = 12
         self.sent = 0
         self.success = 0
         self.failed = 0
         self.active_proxies = 0
-        self.lock = threading.Lock()
+        self.paused = False
         self.start_time = time.time()
+        self.lock = threading.Lock()
 
     def add_success(self):
         with self.lock:
@@ -89,24 +108,31 @@ class Stats:
             self.sent += 1
             self.failed += 1
 
-    def print_progress(self, target):
-        elapsed = max(1, int(time.time() - self.start_time))
-        rate = round(self.success / elapsed, 2)
-        rate_min = int(rate * 60)
-        rate_hour = int(rate * 3600)
-        sys.stdout.write(
-            f"\r{Colors.CYAN}[Hedef: {target}]{Colors.RESET} "
-            f"{Colors.GREEN}Başarılı: {self.success}{Colors.RESET} | "
-            f"{Colors.RED}Drop: {self.failed}{Colors.RESET} | "
-            f"{Colors.YELLOW}Hız: {rate} v/s ({rate_min} v/dk ~ {rate_hour} v/saat){Colors.RESET} | "
-            f"{Colors.BLUE}Süre: {elapsed}s{Colors.RESET} | "
-            f"{Colors.HEADER}Havuz: {self.active_proxies}{Colors.RESET}"
-        )
-        sys.stdout.flush()
+    def get_metrics(self):
+        with self.lock:
+            elapsed = max(1, int(time.time() - self.start_time))
+            rate = round(self.success / elapsed, 2)
+            success_pct = round((self.success / max(1, self.sent)) * 100, 1)
+            return {
+                "target": self.target,
+                "threads": self.threads,
+                "sent": self.sent,
+                "success": self.success,
+                "failed": self.failed,
+                "success_pct": success_pct,
+                "rate_sec": rate,
+                "rate_min": int(rate * 60),
+                "rate_hour": int(rate * 3600),
+                "active_proxies": self.active_proxies,
+                "uptime_sec": elapsed,
+                "paused": self.paused
+            }
+
+
+state = State()
 
 
 def test_cf_proxy(p):
-    """Ultra hızlı Cloudflare trace testi."""
     try:
         r = requests.get(
             "https://cloudflare.com/cdn-cgi/trace",
@@ -141,8 +167,8 @@ def fetch_live_candidates():
     return cand_list
 
 
-def proxy_producer_loop(verified_queue, stats, stop_event):
-    """100 eşzamanlı iş parçacığıyla havuzu sürekli dolu tutar."""
+def proxy_producer_loop(verified_queue, stop_event):
+    logger.emit("100-Thread Turbo Proxy Doğrulayıcı motoru devrede.", "SYSTEM")
     while not stop_event.is_set():
         if verified_queue.qsize() < 100:
             candidates = fetch_live_candidates()
@@ -151,8 +177,8 @@ def proxy_producer_loop(verified_queue, stats, stop_event):
                 for p in results:
                     if p:
                         verified_queue.put(p)
-                        with stats.lock:
-                            stats.active_proxies = verified_queue.qsize()
+                        with state.lock:
+                            state.active_proxies = verified_queue.qsize()
         time.sleep(4)
 
 
@@ -172,6 +198,13 @@ def create_driver(proxy=None):
     options.add_argument("--disk-cache-size=1")
     options.add_argument("--media-cache-size=1")
     options.add_argument("--blink-settings=imagesEnabled=false")
+
+    # Render Linux Chrome path detection
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin and os.path.exists(chrome_bin):
+        options.binary_location = chrome_bin
+    elif os.path.exists("/opt/render/project/chrome/opt/google/chrome/chrome"):
+        options.binary_location = "/opt/render/project/chrome/opt/google/chrome/chrome"
 
     if proxy:
         if not proxy.startswith("http"):
@@ -199,18 +232,23 @@ def create_driver(proxy=None):
     return driver
 
 
-def worker(target_url, verified_queue, stats, timeout):
+def worker(worker_id, verified_queue, timeout):
     while True:
+        if state.paused:
+            time.sleep(1)
+            continue
+
         proxy = None
         if verified_queue is not None:
             try:
                 proxy = verified_queue.get(timeout=3)
-                with stats.lock:
-                    stats.active_proxies = verified_queue.qsize()
+                with state.lock:
+                    state.active_proxies = verified_queue.qsize()
             except queue.Empty:
                 time.sleep(0.2)
                 continue
 
+        target_url = state.target
         driver = None
         try:
             driver = create_driver(proxy=proxy)
@@ -229,12 +267,13 @@ def worker(target_url, verified_queue, stats, timeout):
                     break
 
             if success:
-                stats.add_success()
+                state.add_success()
+                logger.emit(f"Worker #{worker_id} -> View başarıyla gönderildi! (Proxy: {proxy})", "SUCCESS")
             else:
-                stats.add_fail()
+                state.add_fail()
 
-        except Exception:
-            stats.add_fail()
+        except Exception as e:
+            state.add_fail()
         finally:
             if driver:
                 try:
@@ -244,101 +283,410 @@ def worker(target_url, verified_queue, stats, timeout):
             if verified_queue:
                 verified_queue.task_done()
 
-        stats.print_progress(target_url)
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guns.lol Turbo Viewbot Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #090a0f;
+            --card-bg: #11131b;
+            --border: #1e2230;
+            --accent: #00ffcc;
+            --accent-glow: rgba(0, 255, 204, 0.25);
+            --danger: #ff3366;
+            --text-main: #f0f4fc;
+            --text-muted: #79829c;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: var(--bg);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            padding: 24px;
+            min-height: 100vh;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 24px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 24px;
+        }
+        .logo {
+            font-size: 24px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .badge-live {
+            background: rgba(0, 255, 204, 0.15);
+            color: var(--accent);
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid var(--accent);
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .badge-live::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            background: var(--accent);
+            border-radius: 50%;
+            box-shadow: 0 0 8px var(--accent);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+        .card:hover {
+            transform: translateY(-2px);
+            border-color: rgba(0, 255, 204, 0.4);
+        }
+        .card-title {
+            font-size: 13px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+        .card-value {
+            font-size: 32px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            color: #fff;
+        }
+        .card-sub {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-top: 6px;
+        }
+        .terminal-container {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 480px;
+        }
+        .terminal-header {
+            background: #0d0e14;
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .terminal-body {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            background: #07080c;
+        }
+        .log-entry { margin-bottom: 4px; display: flex; gap: 12px; }
+        .log-time { color: #5a647e; }
+        .log-SUCCESS { color: var(--accent); }
+        .log-INFO { color: #82aaff; }
+        .log-WARN { color: #ffcb6b; }
+        .log-ERROR { color: var(--danger); }
+        .log-SYSTEM { color: #c792ea; font-weight: 600; }
+        .controls {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            padding: 16px;
+            border-radius: 12px;
+            align-items: center;
+        }
+        .controls input {
+            flex: 1;
+            background: #07080c;
+            border: 1px solid var(--border);
+            color: #fff;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+        }
+        .controls button {
+            background: var(--accent);
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            font-weight: 700;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .controls button:hover { opacity: 0.9; }
+        .btn-pause { background: #ffcb6b !important; }
+        .btn-danger { background: var(--danger) !important; color: #fff !important; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">
+                <span>🔫 GUNS.LOL TURBO BOT</span>
+                <span class="badge-live">7/24 CLOUD ACTIVE</span>
+            </div>
+            <div id="uptimeBadge" style="font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--text-muted);">
+                Uptime: 0s
+            </div>
+        </div>
+
+        <div class="controls">
+            <input type="text" id="targetInput" value="https://guns.lol/osintowner" placeholder="Hedef URL">
+            <button onclick="updateTarget()">Hedefi Güncelle</button>
+            <button id="toggleBtn" class="btn-pause" onclick="togglePause()">Durdur / Başlat</button>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">Başarılı View</div>
+                <div class="card-value" id="valSuccess" style="color: var(--accent);">0</div>
+                <div class="card-sub" id="valSuccessPct">%100 Başarı Oranı</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Anlık Hız</div>
+                <div class="card-value" id="valSpeed">0.0</div>
+                <div class="card-sub" id="valSpeedExt">0 view / dakika</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Aktif Worker</div>
+                <div class="card-value" id="valWorkers">35</div>
+                <div class="card-sub">Eşzamanlı Browser</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Canlı Proxy Havuzu</div>
+                <div class="card-value" id="valProxies" style="color: #c792ea;">0</div>
+                <div class="card-sub">Cloudflare Doğrulanmış</div>
+            </div>
+        </div>
+
+        <div class="terminal-container">
+            <div class="terminal-header">
+                <span>LIVE SYSTEM CONSOLE</span>
+                <span id="logCount">0 logs</span>
+            </div>
+            <div class="terminal-body" id="terminalBody">
+                <div class="log-entry"><span class="log-time">--:--:--</span><span class="log-SYSTEM">Sistem hazır, konsol akışı bağlanıyor...</span></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchMetrics() {
+            try {
+                const res = await fetch('/api/metrics');
+                const data = await res.json();
+                document.getElementById('valSuccess').innerText = data.success.toLocaleString();
+                document.getElementById('valSuccessPct').innerText = `%${data.success_pct} Başarı Oranı (${data.failed} drop)`;
+                document.getElementById('valSpeed').innerText = `${data.rate_sec} v/s`;
+                document.getElementById('valSpeedExt').innerText = `${data.rate_min} v/dk ~ ${data.rate_hour} v/saat`;
+                document.getElementById('valWorkers').innerText = data.threads;
+                document.getElementById('valProxies').innerText = data.active_proxies;
+                document.getElementById('uptimeBadge').innerText = `Uptime: ${Math.floor(data.uptime_sec / 60)}d ${data.uptime_sec % 60}s`;
+                document.getElementById('targetInput').value = data.target;
+                
+                const btn = document.getElementById('toggleBtn');
+                if (data.paused) {
+                    btn.innerText = "Devam Ettir";
+                    btn.className = "btn-pause";
+                } else {
+                    btn.innerText = "Durdur";
+                    btn.className = "";
+                }
+            } catch (e) {}
+        }
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/api/logs');
+                const logs = await res.json();
+                document.getElementById('logCount').innerText = `${logs.length} logs`;
+                const term = document.getElementById('terminalBody');
+                term.innerHTML = logs.map(l => `
+                    <div class="log-entry">
+                        <span class="log-time">[${l.time}]</span>
+                        <span class="log-${l.level}">${l.message}</span>
+                    </div>
+                `).join('');
+                term.scrollTop = term.scrollHeight;
+            } catch (e) {}
+        }
+
+        async function updateTarget() {
+            const url = document.getElementById('targetInput').value.trim();
+            if (!url) return;
+            await fetch('/api/target', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({target: url})
+            });
+            alert('Hedef güncellendi: ' + url);
+        }
+
+        async function togglePause() {
+            await fetch('/api/toggle', {method: 'POST'});
+            fetchMetrics();
+        }
+
+        setInterval(fetchMetrics, 1000);
+        setInterval(fetchLogs, 1500);
+        fetchMetrics();
+        fetchLogs();
+    </script>
+</body>
+</html>
+"""
 
 
-def start_dummy_health_server():
-    """Render Web Service'in 7/24 uyanık kalması için HTTP port dinleyicisi."""
-    port = int(os.environ.get("PORT", 10000))
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
+class DashboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/" or parsed.path == "/index.html":
             self.send_response(200)
-            self.send_header("Content-type", "text/plain")
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(b"Guns.lol Mega-Turbo Viewbot 24/7 Running Active.")
-        def log_message(self, format, *args):
-            pass
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+        elif parsed.path == "/api/metrics":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(state.get_metrics()).encode("utf-8"))
+        elif parsed.path == "/api/logs":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(logger.get_logs()).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        content_len = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_len).decode('utf-8') if content_len > 0 else ""
+
+        if parsed.path == "/api/target":
+            try:
+                data = json.loads(post_data)
+                new_target = data.get("target", "").strip()
+                if new_target:
+                    if not new_target.startswith("http"):
+                        new_target = f"https://guns.lol/{new_target.lstrip('@')}"
+                    with state.lock:
+                        state.target = new_target
+                    logger.emit(f"Hedef URL güncellendi -> {new_target}", "SYSTEM")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+
+        elif parsed.path == "/api/toggle":
+            with state.lock:
+                state.paused = not state.paused
+            logger.emit(f"Bot durumu değiştirildi: {'DURDURULDU' if state.paused else 'ÇALIŞIYOR'}", "SYSTEM")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_web_server(port):
+    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    logger.emit(f"Web Arayüzü ve Log Dashboard PORT {port} üzerinde başlatıldı.", "SYSTEM")
     server.serve_forever()
 
 
 def main():
     default_threads = int(os.environ.get("THREADS", 35))
     default_target = os.environ.get("TARGET_URL", "https://guns.lol/osintowner")
+    web_port = int(os.environ.get("PORT", 10000))
 
     parser = argparse.ArgumentParser(description="guns.lol Mega-Turbo View Bot (12 CPU / 96 GB RAM Scaled)")
-    parser.add_argument("-u", "--url", "--user", dest="target", default=default_target, help=f"Guns.lol hedefi (varsayılan: {default_target})")
-    parser.add_argument("-t", "--threads", type=int, default=default_threads, help=f"Eşzamanlı browser worker sayısı (varsayılan: {default_threads})")
-    parser.add_argument("--timeout", type=int, default=12, help="View bekleme zaman aşımı saniye (varsayılan: 12)")
-    parser.add_argument("-p", "--proxy-file", dest="proxy_file", help="Özel proxy listesi dosyası (.txt)")
-    parser.add_argument("--direct", action="store_true", help="Proxy olmadan doğrudan bağlantı ile çalıştır")
+    parser.add_argument("-u", "--url", "--user", dest="target", default=default_target, help="Guns.lol hedefi")
+    parser.add_argument("-t", "--threads", type=int, default=default_threads, help="Worker sayısı")
+    parser.add_argument("--timeout", type=int, default=12, help="View zaman aşımı")
+    parser.add_argument("-p", "--proxy-file", dest="proxy_file", help="Özel proxy dosyası")
+    parser.add_argument("--direct", action="store_true", help="Proxy olmadan çalıştır")
     args = parser.parse_args()
 
-    if "PORT" in os.environ or os.environ.get("RENDER"):
-        threading.Thread(target=start_dummy_health_server, daemon=True).start()
+    state.target = args.target.strip()
+    if not state.target.startswith("http"):
+        state.target = f"https://guns.lol/{state.target.lstrip('@')}"
+    state.threads = args.threads
+    state.timeout = args.timeout
 
-    print(f"{Colors.CYAN}{'='*60}")
-    print("      GUNS.LOL MEGA-TURBO CLOUD VIEW BOT [7/24 RENDER]")
-    print(f"           Scaled for High Concurrency (Worker: {args.threads})")
-    print(f"{'='*60}{Colors.RESET}")
+    # Web Dashboard sunucusunu başlat
+    threading.Thread(target=start_web_server, args=(web_port,), daemon=True).start()
 
-    target = args.target.strip()
-    if not target.startswith("http"):
-        target = f"https://guns.lol/{target.lstrip('@')}"
+    logger.emit(f"GUNS.LOL TURBO VIEW BOT AKTİF. Hedef: {state.target} | Worker: {state.threads}", "SYSTEM")
 
     verified_queue = None
     stop_event = threading.Event()
-    stats = Stats()
 
     if not args.direct:
         verified_queue = queue.Queue()
         if args.proxy_file and os.path.exists(args.proxy_file):
-            print(f"{Colors.YELLOW}[*] '{args.proxy_file}' dosyasındaki proxyler yükleniyor...{Colors.RESET}")
+            logger.emit(f"'{args.proxy_file}' dosyasındaki özel proxyler yükleniyor...", "INFO")
             with open(args.proxy_file, "r", encoding="utf-8") as f:
                 p_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
             for p in p_lines:
                 verified_queue.put(p)
-            stats.active_proxies = verified_queue.qsize()
-            print(f"{Colors.GREEN}[+] {stats.active_proxies} adet özel proxy hazır!{Colors.RESET}")
+            state.active_proxies = verified_queue.qsize()
+            logger.emit(f"{state.active_proxies} adet özel proxy yüklendi.", "INFO")
         else:
-            print(f"{Colors.YELLOW}[*] 100-thread Turbo Proxy Doğrulayıcı motoru başlatılıyor...{Colors.RESET}")
-            producer_t = threading.Thread(target=proxy_producer_loop, args=(verified_queue, stats, stop_event), daemon=True)
+            producer_t = threading.Thread(target=proxy_producer_loop, args=(verified_queue, stop_event), daemon=True)
             producer_t.start()
-            
-            print(f"{Colors.YELLOW}[*] İlk havuz dolduruluyor, lütfen bekleyin...{Colors.RESET}")
-            for _ in range(15):
-                time.sleep(1)
-                if verified_queue.qsize() >= 5:
-                    break
-            print(f"{Colors.GREEN}[+] {verified_queue.qsize()} adet canlı Cloudflare proxy hazırlandı!{Colors.RESET}")
 
-    thread_count = args.threads
-
-    print(f"\n{Colors.GREEN}[*] Hedef: {target}{Colors.RESET}")
-    print(f"{Colors.GREEN}[*] Worker Sayısı: {thread_count}{Colors.RESET}")
-    print(f"{Colors.GREEN}[*] Mod: {'Doğrulanmış Canlı Proxy Havuzu' if verified_queue else 'Direct Connection'}{Colors.RESET}")
-    print(f"{Colors.YELLOW}[*] Mega-Turbo bot başlatılıyor... (Durdurmak için CTRL+C){Colors.RESET}\n")
-
-    threads = []
-    for _ in range(thread_count):
-        t = threading.Thread(target=worker, args=(target, verified_queue, stats, args.timeout), daemon=True)
+    for i in range(state.threads):
+        t = threading.Thread(target=worker, args=(i + 1, verified_queue, state.timeout), daemon=True)
         t.start()
-        threads.append(t)
 
     try:
         while True:
-            time.sleep(0.5)
-            stats.print_progress(target)
+            time.sleep(1)
     except KeyboardInterrupt:
         stop_event.set()
-        print(f"\n\n{Colors.YELLOW}[!] İşlem kullanıcı tarafından durduruldu.{Colors.RESET}")
-
-    print(f"\n{Colors.CYAN}{'='*60}")
-    print(f"Toplam Gönderim : {stats.sent}")
-    print(f"Başarılı View   : {stats.success}")
-    print(f"Hatalı / Drop   : {stats.failed}")
-    print(f"{'='*60}{Colors.RESET}")
+        logger.emit("Kullanıcı tarafından durduruldu.", "WARN")
 
 
 if __name__ == "__main__":

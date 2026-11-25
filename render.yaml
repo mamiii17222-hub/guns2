@@ -2,8 +2,10 @@ services:
   - type: web
     name: guns-viewbot
     env: docker
-    plan: standard
     dockerfilePath: Dockerfile
+    plan: standard
+    buildCommand: bash render_build.sh
+    startCommand: python guns_viewbot.py
     envVars:
       - key: PORT
         value: 10000
