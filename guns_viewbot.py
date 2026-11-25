@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 guns.lol Mega-Turbo Automated View Bot with Live Web Dashboard & Log Stream
-Engineered for 24/7 Render Deployment (12 CPU / 96 GB RAM Scaled)
+Engineered for 24/7 Render Deployment (PID Safe & Memory Optimized)
 Author: III
 """
 
@@ -89,8 +89,8 @@ logger = LogManager()
 class State:
     def __init__(self):
         self.target = "https://guns.lol/osintowner"
-        self.threads = 35
-        self.timeout = 12
+        self.threads = 8
+        self.timeout = 22
         self.sent = 0
         self.success = 0
         self.failed = 0
@@ -209,7 +209,6 @@ def get_chrome_executable():
 
 
 def preheat_chromedriver():
-    """Çoklu iş parçacığı çakışmalarını (Race Condition) önlemek için chromedriver'ı ana thread'de önceden hazırlar."""
     try:
         logger.emit("Chromedriver motoru önceden hazırlanıyor...", "SYSTEM")
         p = uc.Patcher()
@@ -249,7 +248,7 @@ def create_driver(proxy=None):
     # Eşzamanlı browser açılış çakışmalarını önleyen mutex kilidi
     with driver_spawn_lock:
         driver = uc.Chrome(options=options)
-        time.sleep(0.1)
+        time.sleep(0.15)
 
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": """
@@ -294,9 +293,9 @@ def worker(worker_id, verified_queue, timeout):
             driver.get(target_url)
 
             success = False
-            iterations = int(timeout / 0.25)
+            iterations = int(timeout / 0.3)
             for _ in range(iterations):
-                time.sleep(0.25)
+                time.sleep(0.3)
                 done = driver.execute_script("return window.__analytics_done || false;")
                 if done:
                     status = driver.execute_script("return window.__analytics_status || 0;")
@@ -306,15 +305,15 @@ def worker(worker_id, verified_queue, timeout):
 
             if success:
                 state.add_success()
-                logger.emit(f"Worker #{worker_id} -> View başarıyla gönderildi! (Proxy: {proxy})", "SUCCESS")
+                logger.emit(f"Worker #{worker_id} -> VIEW BAŞARILI! (Proxy: {proxy})", "SUCCESS")
             else:
                 state.add_fail()
                 logger.emit(f"Worker #{worker_id} -> Zaman aşımı/Drop (Proxy: {proxy})", "WARN")
 
         except Exception as e:
             state.add_fail()
-            err_msg = str(e).split('\n')[0][:80]
-            logger.emit(f"Worker #{worker_id} -> Bağlantı Hatası: {err_msg}", "ERROR")
+            err_msg = str(e).split('\n')[0][:75]
+            logger.emit(f"Worker #{worker_id} -> {err_msg}", "ERROR")
         finally:
             if driver:
                 try:
@@ -523,8 +522,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div class="card">
                 <div class="card-title">Aktif Worker</div>
-                <div class="card-value" id="valWorkers">35</div>
-                <div class="card-sub">Eşzamanlı Browser</div>
+                <div class="card-value" id="valWorkers">8</div>
+                <div class="card-sub">PID Güvenli Browser</div>
             </div>
             <div class="card">
                 <div class="card-title">Canlı Proxy Havuzu</div>
@@ -677,14 +676,14 @@ def start_web_server(port):
 
 
 def main():
-    default_threads = int(os.environ.get("THREADS", 35))
+    default_threads = int(os.environ.get("THREADS", 8))
     default_target = os.environ.get("TARGET_URL", "https://guns.lol/osintowner")
     web_port = int(os.environ.get("PORT", 10000))
 
-    parser = argparse.ArgumentParser(description="guns.lol Mega-Turbo View Bot (12 CPU / 96 GB RAM Scaled)")
+    parser = argparse.ArgumentParser(description="guns.lol Mega-Turbo View Bot (PID Safe & Cloud Scaled)")
     parser.add_argument("-u", "--url", "--user", dest="target", default=default_target, help="Guns.lol hedefi")
     parser.add_argument("-t", "--threads", type=int, default=default_threads, help="Worker sayısı")
-    parser.add_argument("--timeout", type=int, default=12, help="View zaman aşımı")
+    parser.add_argument("--timeout", type=int, default=22, help="View zaman aşımı")
     parser.add_argument("-p", "--proxy-file", dest="proxy_file", help="Özel proxy dosyası")
     parser.add_argument("--direct", action="store_true", help="Proxy olmadan çalıştır")
     args = parser.parse_args()
@@ -703,7 +702,7 @@ def main():
     chrome_path = get_chrome_executable()
     logger.emit(f"Tespit edilen Chrome: {chrome_path}", "INFO")
 
-    # Chromedriver'ı ana thread'de önceden hazırla (race condition önleyici)
+    # Chromedriver'ı ana thread'de önceden hazırla
     preheat_chromedriver()
 
     verified_queue = None
@@ -725,9 +724,11 @@ def main():
             # Havuzun dolması için 5 saniye bekle
             time.sleep(5)
 
+    # Worker'ları Render PID limitini aşmamak için 0.8s aralıklarla kademeli başlat
     for i in range(state.threads):
         t = threading.Thread(target=worker, args=(i + 1, verified_queue, state.timeout), daemon=True)
         t.start()
+        time.sleep(0.8)
 
     try:
         while True:

@@ -30,7 +30,7 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 ENV DISPLAY=:99
 ENV PORT=10000
-ENV THREADS=35
+ENV THREADS=8
 ENV TARGET_URL=https://guns.lol/osintowner
 
 # Start Xvfb virtual display, wait 2s for X11 socket, then launch 35-worker turbo bot
