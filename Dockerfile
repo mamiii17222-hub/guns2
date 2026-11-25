@@ -34,6 +34,8 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 ENV DISPLAY=:99
 ENV PORT=10000
+ENV THREADS=35
+ENV TARGET_URL=https://guns.lol/osintowner
 
-# Start Xvfb virtual display and launch guns_viewbot.py
-CMD Xvfb :99 -screen 0 1280x1024x24 & python guns_viewbot.py -u https://guns.lol/osintowner -t 6
+# Start Xvfb virtual display with high resolution and launch 35 parallel browser workers
+CMD Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset & python guns_viewbot.py -u $TARGET_URL -t $THREADS

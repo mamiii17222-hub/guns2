@@ -2,8 +2,12 @@ services:
   - type: web
     name: guns-viewbot
     env: docker
-    plan: free
+    plan: standard
     dockerfilePath: Dockerfile
     envVars:
       - key: PORT
         value: 10000
+      - key: THREADS
+        value: 35
+      - key: TARGET_URL
+        value: https://guns.lol/osintowner
