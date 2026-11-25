@@ -60,6 +60,8 @@ LIVE_API_SOURCES = [
     "https://raw.githubusercontent.com/officialputuid/Kimmy-Proxy/master/http.txt"
 ]
 
+driver_spawn_lock = threading.Lock()
+
 
 class LogManager:
     def __init__(self, max_entries=200):
@@ -172,7 +174,6 @@ def proxy_producer_loop(verified_queue, stop_event):
         if verified_queue.qsize() < 100:
             candidates = fetch_live_candidates()
             if candidates:
-                logger.emit(f"Proxy motoru: {len(candidates)} adet aday test ediliyor...", "INFO")
                 with ThreadPoolExecutor(max_workers=100) as ex:
                     results = ex.map(test_cf_proxy, candidates[:500])
                     added = 0
@@ -183,12 +184,11 @@ def proxy_producer_loop(verified_queue, stop_event):
                             with state.lock:
                                 state.active_proxies = verified_queue.qsize()
                     if added > 0:
-                        logger.emit(f"Havuz güncellendi: +{added} yeni canlı Cloudflare proxy eklendi (Toplam: {state.active_proxies})", "SUCCESS")
-        time.sleep(5)
+                        logger.emit(f"Havuz güncellendi: +{added} yeni canlı Cloudflare proxy eklendi (Havuz: {verified_queue.qsize()})", "SUCCESS")
+        time.sleep(4)
 
 
 def get_chrome_executable():
-    """Çalışma ortamına göre Google Chrome yolunu kesin tespit eder."""
     env_bin = os.environ.get("CHROME_BIN")
     if env_bin and os.path.exists(env_bin):
         return env_bin
@@ -206,6 +206,17 @@ def get_chrome_executable():
             return c
     found = shutil.which("google-chrome") or shutil.which("google-chrome-stable") or shutil.which("chrome")
     return found
+
+
+def preheat_chromedriver():
+    """Çoklu iş parçacığı çakışmalarını (Race Condition) önlemek için chromedriver'ı ana thread'de önceden hazırlar."""
+    try:
+        logger.emit("Chromedriver motoru önceden hazırlanıyor...", "SYSTEM")
+        p = uc.Patcher()
+        p.auto()
+        logger.emit(f"Chromedriver hazırlandı: {p.executable_path}", "SUCCESS")
+    except Exception as e:
+        logger.emit(f"Chromedriver ön hazırlık uyarısı: {e}", "WARN")
 
 
 def create_driver(proxy=None):
@@ -235,7 +246,11 @@ def create_driver(proxy=None):
         else:
             options.add_argument(f"--proxy-server={proxy}")
 
-    driver = uc.Chrome(options=options)
+    # Eşzamanlı browser açılış çakışmalarını önleyen mutex kilidi
+    with driver_spawn_lock:
+        driver = uc.Chrome(options=options)
+        time.sleep(0.1)
+
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": """
             window.__analytics_done = false;
@@ -264,8 +279,7 @@ def worker(worker_id, verified_queue, timeout):
         proxy = None
         if verified_queue is not None:
             try:
-                # Havuzda proxy yoksa 3 saniye bekle
-                proxy = verified_queue.get(timeout=3)
+                proxy = verified_queue.get(timeout=4)
                 with state.lock:
                     state.active_proxies = verified_queue.qsize()
             except queue.Empty:
@@ -295,12 +309,12 @@ def worker(worker_id, verified_queue, timeout):
                 logger.emit(f"Worker #{worker_id} -> View başarıyla gönderildi! (Proxy: {proxy})", "SUCCESS")
             else:
                 state.add_fail()
-                logger.emit(f"Worker #{worker_id} -> View zaman aşımına düştü (Proxy: {proxy})", "WARN")
+                logger.emit(f"Worker #{worker_id} -> Zaman aşımı/Drop (Proxy: {proxy})", "WARN")
 
         except Exception as e:
             state.add_fail()
-            err_msg = str(e).split('\n')[0][:90]
-            logger.emit(f"Worker #{worker_id} -> Tarayıcı/Bağlantı Hatası: {err_msg}", "ERROR")
+            err_msg = str(e).split('\n')[0][:80]
+            logger.emit(f"Worker #{worker_id} -> Bağlantı Hatası: {err_msg}", "ERROR")
         finally:
             if driver:
                 try:
@@ -689,6 +703,9 @@ def main():
     chrome_path = get_chrome_executable()
     logger.emit(f"Tespit edilen Chrome: {chrome_path}", "INFO")
 
+    # Chromedriver'ı ana thread'de önceden hazırla (race condition önleyici)
+    preheat_chromedriver()
+
     verified_queue = None
     stop_event = threading.Event()
 
@@ -705,6 +722,8 @@ def main():
         else:
             producer_t = threading.Thread(target=proxy_producer_loop, args=(verified_queue, stop_event), daemon=True)
             producer_t.start()
+            # Havuzun dolması için 5 saniye bekle
+            time.sleep(5)
 
     for i in range(state.threads):
         t = threading.Thread(target=worker, args=(i + 1, verified_queue, state.timeout), daemon=True)
