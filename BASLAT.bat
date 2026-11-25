@@ -18,6 +18,6 @@ start http://127.0.0.1:10000
 
 echo [2/2] Turbo Bot motoru baslatiliyor...
 echo.
-python guns_viewbot.py -u https://guns.lol/osintowner -t 12 --timeout 15
+python guns_viewbot.py -u https://guns.lol/osintowner -t 12 --timeout 20
 
 pause

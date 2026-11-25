@@ -90,7 +90,7 @@ class State:
     def __init__(self):
         self.target = "https://guns.lol/osintowner"
         self.threads = 12
-        self.timeout = 16
+        self.timeout = 20
         self.sent = 0
         self.success = 0
         self.failed = 0
@@ -175,11 +175,12 @@ def test_cf_proxy(p):
             return None
     try:
         r = requests.get(
-            "https://cloudflare.com/cdn-cgi/trace",
+            "https://guns.lol/cdn-cgi/trace",
             proxies={"http": f"http://{p}", "https": f"http://{p}"},
-            timeout=2.5
+            timeout=3.5,
+            headers={"User-Agent": "Mozilla/5.0"}
         )
-        if r.status_code == 200 and "ip=" in r.text:
+        if r.status_code == 200 and "ip=" in r.text and "h=guns.lol" in r.text:
             exit_ip = None
             for line in r.text.splitlines():
                 if line.startswith("ip="):
@@ -278,11 +279,12 @@ def preheat_chromedriver():
 
 def create_driver(proxy=None):
     options = uc.ChromeOptions()
+    options.page_load_strategy = "eager"
     options.add_argument("--no-first-run")
     options.add_argument("--no-service-autorun")
     options.add_argument("--password-store=basic")
     options.add_argument("--window-position=-3000,-3000")
-    options.add_argument("--window-size=300,300")
+    options.add_argument("--window-size=400,400")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-extensions")
@@ -355,18 +357,31 @@ def worker(worker_id, verified_queue, timeout):
         try:
             driver = create_driver(proxy=proxy)
             driver.set_page_load_timeout(timeout)
-            driver.get(target_url)
+            try:
+                driver.get(target_url)
+            except Exception:
+                pass
 
             success = False
-            iterations = int(timeout / 0.15)
+            iterations = int(timeout / 0.25)
             for _ in range(iterations):
-                time.sleep(0.15)
-                done = driver.execute_script("return window.__analytics_done || false;")
-                if done:
-                    status = driver.execute_script("return window.__analytics_status || 0;")
-                    if status == 200:
+                time.sleep(0.25)
+                try:
+                    res = driver.execute_script("""
+                        try {
+                            const perf = window.performance.getEntriesByType('resource');
+                            for (let i = 0; i < perf.length; i++) {
+                                if (perf[i].name && perf[i].name.includes('analytics/view')) return 200;
+                            }
+                            if (window.__analytics_done) return window.__analytics_status || 200;
+                            return 0;
+                        } catch(e) { return 0; }
+                    """)
+                    if res == 200:
                         success = True
-                    break
+                        break
+                except Exception:
+                    pass
 
             if success:
                 state.add_success()
@@ -754,7 +769,7 @@ def main():
     parser = argparse.ArgumentParser(description="guns.lol Mega-Turbo View Bot (16GB RAM High-Performance PC Edition)")
     parser.add_argument("-u", "--url", "--user", dest="target", default=default_target, help="Guns.lol hedefi")
     parser.add_argument("-t", "--threads", type=int, default=default_threads, help="Worker sayısı (Varsayılan: 12)")
-    parser.add_argument("--timeout", type=int, default=15, help="View zaman aşımı")
+    parser.add_argument("--timeout", type=int, default=20, help="View zaman aşımı (Varsayılan: 20s)")
     parser.add_argument("-p", "--proxy-file", dest="proxy_file", help="Özel proxy dosyası")
     parser.add_argument("--direct", action="store_true", help="Proxy olmadan çalıştır")
     args = parser.parse_args()
